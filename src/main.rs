@@ -77,12 +77,12 @@ fn main() {
 
             "4" => {
                 if let Some(ref mut fs) = maybe_fs {
-                    let mut name = String::new();
-                    print!("Enter filename (max 28 chars) or leave empty for unnamed inode: ");
+                    let mut path = String::new();
+                    print!("Enter path (e.g. dir1/dir2/file) or leave empty for unnamed inode: ");
                     io::stdout().flush().unwrap();
-                    io::stdin().read_line(&mut name).unwrap();
-                    let name = name.trim();
-                    if name.is_empty() {
+                    io::stdin().read_line(&mut path).unwrap();
+                    let path = path.trim();
+                    if path.is_empty() {
                         match fs.create() {
                             Ok(inumber) => {
                                 println!("Created unnamed inode with number: {}", inumber)
@@ -92,12 +92,49 @@ fn main() {
                             }
                             Err(e) => println!("Error creating file: {:?}", e),
                         }
+                        continue;
+                    }
+
+                    let mut typ = String::new();
+                    print!("Create file or dir? (f/d): ");
+                    io::stdout().flush().unwrap();
+                    io::stdin().read_line(&mut typ).unwrap();
+                    let is_dir = typ.trim().to_lowercase().starts_with('d');
+
+                    let mut perms_in = String::new();
+                    print!("Enter perms in octal (e.g. 644) or leave empty for default: ");
+                    io::stdout().flush().unwrap();
+                    io::stdin().read_line(&mut perms_in).unwrap();
+                    let perms = perms_in.trim().parse::<u16>().unwrap_or(644);
+
+                    let mut roles_in = String::new();
+                    print!("Enter role bits (0-255) or leave empty for 0: ");
+                    io::stdout().flush().unwrap();
+                    io::stdin().read_line(&mut roles_in).unwrap();
+                    let roles = roles_in.trim().parse::<u8>().unwrap_or(0u8);
+
+                    if is_dir {
+                        match fs.create_dir(path, perms, roles) {
+                            Ok(inumber) => println!("Created dir '{}' inumber {}", path, inumber),
+                            Err(e) => println!("Failed to create dir: {:?}", e),
+                        }
                     } else {
-                        match fs.create_named(name) {
+                        let mut ext = String::new();
+                        print!("Enter extension (e.g. txt) or leave empty: ");
+                        io::stdout().flush().unwrap();
+                        io::stdin().read_line(&mut ext).unwrap();
+                        let _ext = ext.trim();
+                        // create file with collected attrs
+                        match fs.create_named_with_attrs(
+                            path,
+                            perms,
+                            roles,
+                            if _ext.is_empty() { None } else { Some(_ext) },
+                        ) {
                             Ok(inumber) => {
-                                println!("Created named file '{}' inumber {}", name, inumber)
+                                println!("Created file '{}' inumber {}", path, inumber)
                             }
-                            Err(e) => println!("Failed to create named file: {:?}", e),
+                            Err(e) => println!("Failed to create file: {:?}", e),
                         }
                     }
                 } else {
@@ -136,7 +173,12 @@ fn main() {
                     let offset: usize = offset_input.trim().parse().unwrap_or(0);
 
                     let mut buf: Vec<u8> = Vec::new();
-                    match fs.read_named(name, &mut buf, offset) {
+                    let mut role_in = String::new();
+                    print!("Enter caller role (0-255) or leave empty for 0: ");
+                    io::stdout().flush().unwrap();
+                    io::stdin().read_line(&mut role_in).unwrap();
+                    let role = role_in.trim().parse::<u8>().unwrap_or(0u8);
+                    match fs.read_named_with_role(name, &mut buf, offset, role) {
                         Ok(n) => {
                             println!("Read {} bytes:", n);
                             match std::str::from_utf8(&buf) {
@@ -171,7 +213,12 @@ fn main() {
                     io::stdin().read_line(&mut content).unwrap();
                     let bytes = content.into_bytes();
 
-                    match fs.write_named(name, bytes, offset) {
+                    let mut role_in = String::new();
+                    print!("Enter caller role (0-255) or leave empty for 0: ");
+                    io::stdout().flush().unwrap();
+                    io::stdin().read_line(&mut role_in).unwrap();
+                    let role = role_in.trim().parse::<u8>().unwrap_or(0u8);
+                    match fs.write_named_with_role(name, bytes, offset, role) {
                         Ok(n) => println!("Wrote {} bytes to '{}'", n, name),
                         Err(e) => println!("Write failed: {:?}", e),
                     }
@@ -187,7 +234,12 @@ fn main() {
                     io::stdout().flush().unwrap();
                     io::stdin().read_line(&mut name).unwrap();
                     let name = name.trim();
-                    match fs.remove_named(name) {
+                    let mut role_in = String::new();
+                    print!("Enter caller role (0-255) or leave empty for 0: ");
+                    io::stdout().flush().unwrap();
+                    io::stdin().read_line(&mut role_in).unwrap();
+                    let role = role_in.trim().parse::<u8>().unwrap_or(0u8);
+                    match fs.remove_named_with_role(name, role) {
                         Ok(true) => println!("Deleted '{}'.", name),
                         Ok(false) => println!("'{}' not found.", name),
                         Err(e) => println!("Delete failed: {:?}", e),
@@ -201,14 +253,32 @@ fn main() {
                 if let Some(ref mut fs) = maybe_fs {
                     match fs.list_files() {
                         Ok(files) => {
-                            println!("Name\tInumber\tSize\tData");
-                            for (name, inum, data) in files {
+                            println!(
+                                "{:<24} {:<6} {:<8} {:<6} {:<8} {:<6} {:<8} {}",
+                                "Name", "Type", "Inumber", "Size", "Perms", "Roles", "Ext", "Data"
+                            );
+                            println!("{:-<120}", "");
+                            for (name, inum, data, is_dir, perms, roles, ext) in files {
                                 let size = data.len();
-                                let preview = match std::str::from_utf8(&data) {
-                                    Ok(s) => s.to_string(),
-                                    Err(_) => format!("{:?}", data),
+                                let preview = if size == 0 {
+                                    "".to_string()
+                                } else {
+                                    match std::str::from_utf8(&data) {
+                                        Ok(s) => {
+                                            if s.len() > 40 {
+                                                format!("{}...", &s[..40])
+                                            } else {
+                                                s.to_string()
+                                            }
+                                        }
+                                        Err(_) => format!("{:?}", &data[..std::cmp::min(40, size)]),
+                                    }
                                 };
-                                println!("{}\t{}\t{}\t{}", name, inum, size, preview);
+                                let ftype = if is_dir { "dir" } else { "file" };
+                                println!(
+                                    "{:<24} {:<6} {:<8} {:<6} {:<#06o} {:<6} {:<8} {}",
+                                    name, ftype, inum, size, perms, roles, ext, preview
+                                );
                             }
                         }
                         Err(e) => println!("Failed to list files: {:?}", e),

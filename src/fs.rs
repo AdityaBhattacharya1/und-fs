@@ -14,14 +14,16 @@ const POINTERS_PER_INODE: u32 = 5;
 const POINTERS_PER_BLOCK: u32 = 1024;
 const INODE_BLOCKS_FRACTION: f64 = 0.10;
 const INODE_SIZE: usize = 32;
-const DIR_NAME_LEN: usize = 28;
-const DIR_ENTRY_SIZE: usize = DIR_NAME_LEN + 4; // name + inumber
+const DIR_NAME_LEN: usize = 20;
+const DIR_EXT_LEN: usize = 8;
+const DIR_ENTRY_SIZE: usize = 64;
 
 #[derive(Debug)]
 pub enum FileSystemError {
     DiskWriteFailure,
     DiskReadFailure,
     MiscellaneousFailure,
+    PermissionDenied,
     InvalidSuperblock,
     NoFreeInodes,
 }
@@ -104,7 +106,6 @@ impl FileSystem<BlockDisk> for SimpleFileSystem<BlockDisk> {
             Err(_e) => return Err(FileSystemError::DiskWriteFailure),
         };
 
-        // initialize inode blocks
         for i in 1..=num_inode_blocks {
             match disk.write(i as usize, vec![0; BLOCK_SIZE]) {
                 Ok(()) => {}
@@ -112,7 +113,6 @@ impl FileSystem<BlockDisk> for SimpleFileSystem<BlockDisk> {
             };
         }
 
-        // initialize a single directory block right after inode blocks
         let dir_index = 1 + num_inode_blocks as usize;
         match disk.write(dir_index, vec![0; BLOCK_SIZE]) {
             Ok(()) => {}
@@ -137,13 +137,11 @@ impl FileSystem<BlockDisk> for SimpleFileSystem<BlockDisk> {
             return Err(FileSystemError::InvalidSuperblock);
         }
 
-        // read first inode block
         let inode_block: Vec<u8> = match disk.read(1) {
             Ok(bytes) => bytes,
             Err(_e) => return Err(FileSystemError::DiskReadFailure),
         };
 
-        // read directory block after inode blocks
         let dir_index = 1 + superblock.num_inode_blocks as usize;
         let dir_block: Vec<u8> = match disk.read(dir_index) {
             Ok(bytes) => bytes,
@@ -180,7 +178,6 @@ impl FileSystem<BlockDisk> for SimpleFileSystem<BlockDisk> {
             }
         }
 
-        // mark superblock, inode blocks and dir block as used
         filesystem.bitmap[0] = false;
         for i in 1..=filesystem.superblock.num_inode_blocks as usize {
             if i < filesystem.bitmap.len() {
@@ -515,12 +512,161 @@ impl SimpleFileSystem<BlockDisk> {
     }
 
     // Directory helpers: fixed-size entries in dir_block
+    fn parse_path(path: &str) -> Vec<&str> {
+        path.split('/').filter(|s| !s.is_empty()).collect()
+    }
+
+    // return directory entry metadata for a path (searches root and nested dirs)
+    fn get_entry_metadata(
+        &mut self,
+        path: &str,
+    ) -> Result<(usize, usize, bool, u16, u8, String), FileSystemError> {
+        let parts = SimpleFileSystem::<BlockDisk>::parse_path(path);
+        if parts.is_empty() {
+            return Err(FileSystemError::MiscellaneousFailure);
+        }
+        // find parent block and entry offset
+        let (parent, base) = if parts.len() == 1 {
+            (None, parts[0])
+        } else {
+            (
+                self.lookup_path(&parts[..parts.len() - 1].join("/")),
+                parts[parts.len() - 1],
+            )
+        };
+        let block_index = if let Some(pin) = parent {
+            let p = self.get_inode(pin)?;
+            let ptr = p.direct[0] as usize;
+            if ptr == 0 {
+                return Err(FileSystemError::MiscellaneousFailure);
+            }
+            ptr
+        } else {
+            1 + self.superblock.num_inode_blocks as usize
+        };
+        let block = self
+            .disk
+            .read(block_index)
+            .map_err(|_| FileSystemError::DiskReadFailure)?;
+        let entries = BLOCK_SIZE / DIR_ENTRY_SIZE;
+        for i in 0..entries {
+            let off = i * DIR_ENTRY_SIZE;
+            let name_bytes = &block[off..off + DIR_NAME_LEN];
+            let end = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(DIR_NAME_LEN);
+            if end == 0 {
+                continue;
+            }
+            if let Ok(entry_name) = std::str::from_utf8(&name_bytes[..end]) {
+                if entry_name == base {
+                    let inum_slice = &block[off + DIR_NAME_LEN..off + DIR_NAME_LEN + 4];
+                    let inum_bytes: [u8; 4] = inum_slice
+                        .try_into()
+                        .map_err(|_| FileSystemError::MiscellaneousFailure)?;
+                    let inum = SimpleFileSystem::<BlockDisk>::slice_to_u32(&inum_bytes) as usize;
+                    let entry_type = block[off + DIR_NAME_LEN + 4];
+                    let perms_slice = &block[off + DIR_NAME_LEN + 5..off + DIR_NAME_LEN + 7];
+                    let perms_bytes: [u8; 2] = perms_slice.try_into().unwrap_or([0u8; 2]);
+                    let perms = u16::from_be_bytes(perms_bytes);
+                    let roles = block[off + DIR_NAME_LEN + 7];
+                    let ext_slice =
+                        &block[off + DIR_NAME_LEN + 8..off + DIR_NAME_LEN + 8 + DIR_EXT_LEN];
+                    let ext = match std::str::from_utf8(ext_slice) {
+                        Ok(s) => s.trim_matches(char::from(0)).to_string(),
+                        Err(_) => String::new(),
+                    };
+                    return Ok((inum, off, entry_type == 1u8, perms, roles, ext));
+                }
+            }
+        }
+        Err(FileSystemError::MiscellaneousFailure)
+    }
+
+    fn check_access(&self, entry_roles: u8, caller_role: u8) -> bool {
+        if entry_roles == 0 {
+            return true;
+        }
+        (entry_roles & caller_role) != 0
+    }
+
+    pub fn read_named_with_role(
+        &mut self,
+        name: &str,
+        data: &mut Vec<u8>,
+        offset: usize,
+        caller_role: u8,
+    ) -> Result<usize, FileSystemError> {
+        let (inum, _off, is_dir, _perms, roles, _ext) = self.get_entry_metadata(name)?;
+        if is_dir {
+            return Err(FileSystemError::MiscellaneousFailure);
+        }
+        if !self.check_access(roles, caller_role) {
+            return Err(FileSystemError::PermissionDenied);
+        }
+        self.read(inum, data, offset)
+    }
+
+    pub fn write_named_with_role(
+        &mut self,
+        name: &str,
+        data: Vec<u8>,
+        offset: usize,
+        caller_role: u8,
+    ) -> Result<usize, FileSystemError> {
+        let (inum, _off, is_dir, _perms, roles, _ext) = self.get_entry_metadata(name)?;
+        if is_dir {
+            return Err(FileSystemError::MiscellaneousFailure);
+        }
+        if !self.check_access(roles, caller_role) {
+            return Err(FileSystemError::PermissionDenied);
+        }
+        self.write(inum, data, offset)
+    }
+
+    pub fn remove_named_with_role(
+        &mut self,
+        name: &str,
+        caller_role: u8,
+    ) -> Result<bool, FileSystemError> {
+        let (inum, _off, _is_dir, _perms, roles, _ext) = self.get_entry_metadata(name)?;
+        if !self.check_access(roles, caller_role) {
+            return Err(FileSystemError::PermissionDenied);
+        }
+        self.remove(inum)
+    }
+
+    fn lookup_dir_in_block(block: &Vec<u8>, name: &str) -> Option<(usize, usize)> {
+        let entries = BLOCK_SIZE / DIR_ENTRY_SIZE;
+        for i in 0..entries {
+            let off = i * DIR_ENTRY_SIZE;
+            let name_bytes = &block[off..off + DIR_NAME_LEN];
+            let end = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(DIR_NAME_LEN);
+            if end == 0 {
+                continue;
+            }
+            if let Ok(entry_name) = std::str::from_utf8(&name_bytes[..end]) {
+                if entry_name == name {
+                    let inum_bytes: [u8; 4] = block[off + DIR_NAME_LEN..off + DIR_NAME_LEN + 4]
+                        .try_into()
+                        .unwrap();
+                    let inum = SimpleFileSystem::<BlockDisk>::slice_to_u32(&inum_bytes) as usize;
+                    return Some((inum, off));
+                }
+            }
+        }
+        None
+    }
+
     fn lookup_dir(&self, name: &str) -> Option<usize> {
         let entries = BLOCK_SIZE / DIR_ENTRY_SIZE;
         for i in 0..entries {
             let off = i * DIR_ENTRY_SIZE;
             let name_bytes = &self.dir_block[off..off + DIR_NAME_LEN];
-            // find null terminator
             let end = name_bytes
                 .iter()
                 .position(|&b| b == 0)
@@ -533,7 +679,8 @@ impl SimpleFileSystem<BlockDisk> {
                 Err(_) => continue,
             };
             if entry_name == name {
-                let inum_bytes: [u8; 4] = self.dir_block[off + DIR_NAME_LEN..off + DIR_ENTRY_SIZE]
+                let inum_bytes: [u8; 4] = self.dir_block
+                    [off + DIR_NAME_LEN..off + DIR_NAME_LEN + 4]
                     .try_into()
                     .unwrap();
                 let inum = SimpleFileSystem::<BlockDisk>::slice_to_u32(&inum_bytes) as usize;
@@ -541,6 +688,119 @@ impl SimpleFileSystem<BlockDisk> {
             }
         }
         None
+    }
+
+    fn lookup_path(&mut self, path: &str) -> Option<usize> {
+        let parts = SimpleFileSystem::<BlockDisk>::parse_path(path);
+        if parts.is_empty() {
+            return None;
+        }
+        // start at root dir block (owned clone so we can swap in deeper blocks)
+        let mut current_block: Vec<u8> = self.dir_block.clone();
+        let mut inum: Option<usize> = None;
+        for (idx, part) in parts.iter().enumerate() {
+            if idx == 0 {
+                match SimpleFileSystem::<BlockDisk>::lookup_dir_in_block(&current_block, part) {
+                    Some((n, _off)) => {
+                        inum = Some(n);
+                    }
+                    None => return None,
+                }
+            } else {
+                // for deeper levels, we need to read the directory block using previously found inum
+                if let Some(parent_inum) = inum {
+                    // assume directories are represented by an inode whose first direct pointer points to its dir block
+                    let parent_inode = match self.get_inode(parent_inum) {
+                        Ok(i) => i,
+                        Err(_) => return None,
+                    };
+                    let dir_block_ptr = parent_inode.direct[0] as usize;
+                    if dir_block_ptr == 0 {
+                        return None;
+                    }
+                    let block = match self.disk.read(dir_block_ptr) {
+                        Ok(b) => b,
+                        Err(_) => return None,
+                    };
+                    match SimpleFileSystem::<BlockDisk>::lookup_dir_in_block(&block, part) {
+                        Some((n, _off)) => {
+                            inum = Some(n);
+                            current_block = block;
+                        }
+                        None => return None,
+                    }
+                } else {
+                    return None;
+                }
+            }
+        }
+        inum
+    }
+
+    fn add_path_entry(
+        &mut self,
+        parent_inum: Option<usize>,
+        name: &str,
+        inumber: usize,
+        is_dir: bool,
+        perms: u16,
+        roles: u8,
+        ext: Option<&str>,
+    ) -> Result<(), FileSystemError> {
+        let block_index = if let Some(pin) = parent_inum {
+            let parent_inode = self.get_inode(pin)?;
+            let ptr = parent_inode.direct[0] as usize;
+            if ptr == 0 {
+                return Err(FileSystemError::MiscellaneousFailure);
+            }
+            ptr
+        } else {
+            1 + self.superblock.num_inode_blocks as usize
+        };
+        let mut block = self
+            .disk
+            .read(block_index)
+            .map_err(|_| FileSystemError::DiskReadFailure)?;
+        let entries = BLOCK_SIZE / DIR_ENTRY_SIZE;
+        for i in 0..entries {
+            let off = i * DIR_ENTRY_SIZE;
+            let name_bytes = &block[off..off + DIR_NAME_LEN];
+            let end = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(DIR_NAME_LEN);
+            if end == 0 {
+                // free slot
+                for (j, &b) in name.as_bytes().iter().enumerate() {
+                    block[off + j] = b;
+                }
+                if name.len() < DIR_NAME_LEN {
+                    block[off + name.len()] = 0;
+                }
+                block[off + DIR_NAME_LEN..off + DIR_NAME_LEN + 4]
+                    .copy_from_slice(&(inumber as u32).to_be_bytes());
+                block[off + DIR_NAME_LEN + 4] = if is_dir { 1u8 } else { 0u8 };
+                block[off + DIR_NAME_LEN + 5..off + DIR_NAME_LEN + 7]
+                    .copy_from_slice(&perms.to_be_bytes());
+                block[off + DIR_NAME_LEN + 7] = roles;
+                if let Some(exts) = ext {
+                    let mut ext_bytes = [0u8; DIR_EXT_LEN];
+                    for (k, &b) in exts.as_bytes().iter().enumerate().take(DIR_EXT_LEN) {
+                        ext_bytes[k] = b;
+                    }
+                    block[off + DIR_NAME_LEN + 8..off + DIR_NAME_LEN + 8 + DIR_EXT_LEN]
+                        .copy_from_slice(&ext_bytes);
+                }
+                self.disk
+                    .write(block_index, block.clone())
+                    .map_err(|_| FileSystemError::DiskWriteFailure)?;
+                if block_index == 1 + self.superblock.num_inode_blocks as usize {
+                    self.dir_block = block.clone();
+                }
+                return Ok(());
+            }
+        }
+        Err(FileSystemError::MiscellaneousFailure)
     }
 
     fn add_dir(&mut self, name: &str, inumber: usize) -> Result<(), FileSystemError> {
@@ -556,19 +816,23 @@ impl SimpleFileSystem<BlockDisk> {
                 .position(|&b| b == 0)
                 .unwrap_or(DIR_NAME_LEN);
             if end == 0 {
-                // free slot
-                // write name
                 let mut new_block = self.dir_block.clone();
+                // name
                 for (j, &b) in name.as_bytes().iter().enumerate() {
                     new_block[off + j] = b;
                 }
-                // null terminate rest
                 if name.len() < DIR_NAME_LEN {
                     new_block[off + name.len()] = 0;
                 }
-                // write inumber
-                new_block[off + DIR_NAME_LEN..off + DIR_ENTRY_SIZE]
+                // inumber
+                new_block[off + DIR_NAME_LEN..off + DIR_NAME_LEN + 4]
                     .copy_from_slice(&(inumber as u32).to_be_bytes());
+                // default type = file (0), default perms 0o644, roles 0, ext blank
+                new_block[off + DIR_NAME_LEN + 4] = 0u8; // entry_type
+                new_block[off + DIR_NAME_LEN + 5..off + DIR_NAME_LEN + 7]
+                    .copy_from_slice(&(0o644u16).to_be_bytes());
+                new_block[off + DIR_NAME_LEN + 7] = 0u8; // roles
+                                                         // extension left zeroed
                 self.disk
                     .write(
                         1 + self.superblock.num_inode_blocks as usize,
@@ -602,7 +866,6 @@ impl SimpleFileSystem<BlockDisk> {
                 Err(_) => continue,
             };
             if entry_name == name {
-                // clear the entry
                 let mut new_block = self.dir_block.clone();
                 for k in 0..DIR_ENTRY_SIZE {
                     new_block[off + k] = 0;
@@ -623,20 +886,58 @@ impl SimpleFileSystem<BlockDisk> {
         Ok(false)
     }
 
-    // high-level named APIs
     pub fn create_named(&mut self, name: &str) -> Result<usize, FileSystemError> {
-        if self.lookup_dir(name).is_some() {
+        // backward-compatible wrapper: defaults
+        self.create_named_with_attrs(name, 0o644, 0u8, None)
+    }
+
+    pub fn create_named_with_attrs(
+        &mut self,
+        name: &str,
+        perms: u16,
+        roles: u8,
+        ext: Option<&str>,
+    ) -> Result<usize, FileSystemError> {
+        // allow path like "a/b/c"; create in parent and add entry
+        let parts = SimpleFileSystem::<BlockDisk>::parse_path(name);
+        if parts.is_empty() {
+            return Err(FileSystemError::MiscellaneousFailure);
+        }
+        let (parent, base) = if parts.len() == 1 {
+            (None, parts[0])
+        } else {
+            (
+                self.lookup_path(&parts[..parts.len() - 1].join("/")),
+                parts[parts.len() - 1],
+            )
+        };
+        if self.lookup_path(name).is_some() {
             return Err(FileSystemError::MiscellaneousFailure);
         }
         let inum = self.create()?;
-        self.add_dir(name, inum)?;
+        self.add_path_entry(parent, base, inum, false, perms, roles, ext)?;
         Ok(inum)
     }
 
     pub fn remove_named(&mut self, name: &str) -> Result<bool, FileSystemError> {
-        if let Some(inum) = self.lookup_dir(name) {
+        if let Some(inum) = self.lookup_path(name) {
             self.remove(inum)?;
-            let _ = self.remove_dir(name)?;
+            // remove dir entry from parent
+            let parts = SimpleFileSystem::<BlockDisk>::parse_path(name);
+            let parent = if parts.len() == 1 {
+                None
+            } else {
+                self.lookup_path(&parts[..parts.len() - 1].join("/"))
+            };
+            if let Some(p) = parent {
+                // remove from parent's dir block
+                // TODO: implement remove in subdir; for now, only support root
+                if p == 0 {
+                    let _ = self.remove_dir(parts[parts.len() - 1]);
+                }
+            } else {
+                let _ = self.remove_dir(parts[0]);
+            }
             Ok(true)
         } else {
             Ok(false)
@@ -649,7 +950,7 @@ impl SimpleFileSystem<BlockDisk> {
         data: &mut Vec<u8>,
         offset: usize,
     ) -> Result<usize, FileSystemError> {
-        if let Some(inum) = self.lookup_dir(name) {
+        if let Some(inum) = self.lookup_path(name) {
             self.read(inum, data, offset)
         } else {
             Err(FileSystemError::MiscellaneousFailure)
@@ -662,19 +963,79 @@ impl SimpleFileSystem<BlockDisk> {
         data: Vec<u8>,
         offset: usize,
     ) -> Result<usize, FileSystemError> {
-        if let Some(inum) = self.lookup_dir(name) {
+        if let Some(inum) = self.lookup_path(name) {
             self.write(inum, data, offset)
         } else {
             Err(FileSystemError::MiscellaneousFailure)
         }
     }
 
-    pub fn list_files(&mut self) -> Result<Vec<(String, usize, Vec<u8>)>, FileSystemError> {
-        let mut results: Vec<(String, usize, Vec<u8>)> = Vec::new();
+    pub fn create_dir(
+        &mut self,
+        path: &str,
+        perms: u16,
+        roles: u8,
+    ) -> Result<usize, FileSystemError> {
+        let parts = SimpleFileSystem::<BlockDisk>::parse_path(path);
+        if parts.is_empty() {
+            return Err(FileSystemError::MiscellaneousFailure);
+        }
+        let (parent, base) = if parts.len() == 1 {
+            (None, parts[0])
+        } else {
+            (
+                self.lookup_path(&parts[..parts.len() - 1].join("/")),
+                parts[parts.len() - 1],
+            )
+        };
+        if self.lookup_path(path).is_some() {
+            return Err(FileSystemError::MiscellaneousFailure);
+        }
+        let inum = self.create()?;
+        // create a dir block for this inode
+        let b = self.allocate_block()?;
+        // write empty dir block
+        self.disk
+            .write(b, vec![0; BLOCK_SIZE])
+            .map_err(|_| FileSystemError::DiskWriteFailure)?;
+        // set inode's first direct pointer to this dir block
+        let mut inode = self.get_inode(inum)?;
+        inode.direct[0] = b as u32;
+        inode.valid = 1;
+        inode.size = 0;
+        self.write_inode(inum, &inode)?;
+        self.add_path_entry(parent, base, inum, true, perms, roles, None)?;
+        Ok(inum)
+    }
+
+    pub fn list_files(
+        &mut self,
+    ) -> Result<Vec<(String, usize, Vec<u8>, bool, u16, u8, String)>, FileSystemError> {
+        let mut results: Vec<(String, usize, Vec<u8>, bool, u16, u8, String)> = Vec::new();
+        let root_block_index = 1 + self.superblock.num_inode_blocks as usize;
+
+        let root_block = match self.disk.read(root_block_index) {
+            Ok(b) => b,
+            Err(_) => return Err(FileSystemError::DiskReadFailure),
+        };
+        self.list_dir_recursive(&root_block, "", 0, &mut results);
+        Ok(results)
+    }
+
+    fn list_dir_recursive(
+        &mut self,
+        block: &Vec<u8>,
+        prefix: &str,
+        depth: usize,
+        results: &mut Vec<(String, usize, Vec<u8>, bool, u16, u8, String)>,
+    ) {
+        if depth > 10 {
+            return;
+        }
         let entries = BLOCK_SIZE / DIR_ENTRY_SIZE;
         for i in 0..entries {
             let off = i * DIR_ENTRY_SIZE;
-            let name_bytes = &self.dir_block[off..off + DIR_NAME_LEN];
+            let name_bytes = &block[off..off + DIR_NAME_LEN];
             let end = name_bytes
                 .iter()
                 .position(|&b| b == 0)
@@ -686,15 +1047,47 @@ impl SimpleFileSystem<BlockDisk> {
                 Ok(s) => s.to_string(),
                 Err(_) => continue,
             };
-            let inum_bytes: [u8; 4] = self.dir_block[off + DIR_NAME_LEN..off + DIR_ENTRY_SIZE]
-                .try_into()
-                .unwrap();
+            let full_path = if prefix.is_empty() {
+                entry_name.clone()
+            } else {
+                format!("{}/{}", prefix, entry_name)
+            };
+            let inum_slice = &block[off + DIR_NAME_LEN..off + DIR_NAME_LEN + 4];
+            let inum_bytes: [u8; 4] = match inum_slice.try_into() {
+                Ok(arr) => arr,
+                Err(_) => continue,
+            };
             let inum = SimpleFileSystem::<BlockDisk>::slice_to_u32(&inum_bytes) as usize;
+            let entry_type = block[off + DIR_NAME_LEN + 4];
+            let perms_slice = &block[off + DIR_NAME_LEN + 5..off + DIR_NAME_LEN + 7];
+            let perms_bytes: [u8; 2] = match perms_slice.try_into() {
+                Ok(arr) => arr,
+                Err(_) => [0u8; 2],
+            };
+            let perms = u16::from_be_bytes(perms_bytes);
+            let roles = block[off + DIR_NAME_LEN + 7];
+            let ext_slice = &block[off + DIR_NAME_LEN + 8..off + DIR_NAME_LEN + 8 + DIR_EXT_LEN];
+            let ext = match std::str::from_utf8(ext_slice) {
+                Ok(s) => s.trim_matches(char::from(0)).to_string(),
+                Err(_) => String::new(),
+            };
             let mut data: Vec<u8> = Vec::new();
-            let _ = self.read(inum, &mut data, 0);
-            results.push((entry_name, inum, data));
+            if inum != 0 && entry_type == 0u8 {
+                let _ = self.read(inum, &mut data, 0);
+            }
+            let is_dir = entry_type == 1u8;
+            results.push((full_path.clone(), inum, data, is_dir, perms, roles, ext));
+            if is_dir {
+                if let Ok(parent_inode) = self.get_inode(inum) {
+                    let dir_ptr = parent_inode.direct[0] as usize;
+                    if dir_ptr != 0 {
+                        if let Ok(child_block) = self.disk.read(dir_ptr) {
+                            self.list_dir_recursive(&child_block, &full_path, depth + 1, results);
+                        }
+                    }
+                }
+            }
         }
-        Ok(results)
     }
 
     fn get_inode(&self, inumber: usize) -> Result<Inode, FileSystemError> {
