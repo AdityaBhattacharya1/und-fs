@@ -591,6 +591,25 @@ impl SimpleFileSystem<BlockDisk> {
         (entry_roles & caller_role) != 0
     }
 
+    // try to find an inode by matching the basename across the whole filesystem
+    fn find_inode_by_basename(
+        &mut self,
+        name: &str,
+    ) -> Result<(usize, bool, u16, u8), FileSystemError> {
+        let files = self.list_files()?;
+        for (fullpath, inum, _data, is_dir, perms, roles, _ext) in files {
+            // extract basename from fullpath
+            let basename = match fullpath.rsplit('/').next() {
+                Some(b) => b,
+                None => &fullpath,
+            };
+            if basename == name {
+                return Ok((inum, is_dir, perms, roles));
+            }
+        }
+        Err(FileSystemError::MiscellaneousFailure)
+    }
+
     pub fn read_named_with_role(
         &mut self,
         name: &str,
@@ -598,7 +617,14 @@ impl SimpleFileSystem<BlockDisk> {
         offset: usize,
         caller_role: u8,
     ) -> Result<usize, FileSystemError> {
-        let (inum, _off, is_dir, _perms, roles, _ext) = self.get_entry_metadata(name)?;
+        // Try exact path lookup first; if that fails, try finding by basename anywhere in the tree.
+        let (inum, _off, is_dir, _perms, roles, _ext) = match self.get_entry_metadata(name) {
+            Ok(tuple) => tuple,
+            Err(_) => {
+                let (inum2, is_dir2, perms2, roles2) = self.find_inode_by_basename(name)?;
+                (inum2, 0usize, is_dir2, perms2, roles2, String::new())
+            }
+        };
         if is_dir {
             return Err(FileSystemError::MiscellaneousFailure);
         }
@@ -615,7 +641,13 @@ impl SimpleFileSystem<BlockDisk> {
         offset: usize,
         caller_role: u8,
     ) -> Result<usize, FileSystemError> {
-        let (inum, _off, is_dir, _perms, roles, _ext) = self.get_entry_metadata(name)?;
+        let (inum, _off, is_dir, _perms, roles, _ext) = match self.get_entry_metadata(name) {
+            Ok(tuple) => tuple,
+            Err(_) => {
+                let (inum2, is_dir2, perms2, roles2) = self.find_inode_by_basename(name)?;
+                (inum2, 0usize, is_dir2, perms2, roles2, String::new())
+            }
+        };
         if is_dir {
             return Err(FileSystemError::MiscellaneousFailure);
         }
@@ -630,7 +662,13 @@ impl SimpleFileSystem<BlockDisk> {
         name: &str,
         caller_role: u8,
     ) -> Result<bool, FileSystemError> {
-        let (inum, _off, _is_dir, _perms, roles, _ext) = self.get_entry_metadata(name)?;
+        let (inum, _off, _is_dir, _perms, roles, _ext) = match self.get_entry_metadata(name) {
+            Ok(tuple) => tuple,
+            Err(_) => {
+                let (inum2, is_dir2, perms2, roles2) = self.find_inode_by_basename(name)?;
+                (inum2, 0usize, is_dir2, perms2, roles2, String::new())
+            }
+        };
         if !self.check_access(roles, caller_role) {
             return Err(FileSystemError::PermissionDenied);
         }
